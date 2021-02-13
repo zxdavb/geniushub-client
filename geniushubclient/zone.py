@@ -4,19 +4,20 @@ import logging
 import re
 from typing import Dict, List  # Any, Optional, Set, Tuple
 
-from .const import (
+from geniushubclient.const import (
     ATTRS_ZONE,
     FOOTPRINT_MODES,
     IDAY_TO_DAY,
     IMODE_TO_MODE,
-    ITYPE_TO_TYPE,
     MODE_TO_IMODE,
     TYPE_TO_ITYPE,
     ZONE_KIT,
     ZONE_MODE,
     ZONE_TYPE,
 )
-from .device import GeniusBase
+from geniushubclient.device import GeniusBase
+from geniushubclient.zoneclasses.properties import Properties
+from geniushubclient.zoneclasses.state import State
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -39,8 +40,19 @@ class GeniusZone(GeniusBase):
     def __init__(self, zone_id, raw_json, hub) -> None:
         super().__init__(zone_id, raw_json, hub, ATTRS_ZONE)
 
+        self._properties = Properties()
+        self._state = State()
+
         self.device_objs = []
         self.device_by_id = {}
+
+        if self._hub.api_version == 3:
+            self.update(raw_json)
+
+    def update(self, json):
+        """Parse the json for the zone data."""
+        self._properties.update(json)
+        self._state.update(json, self._properties.zone_type)
 
     @property
     def data(self) -> Dict:
@@ -58,7 +70,8 @@ class GeniusZone(GeniusBase):
             O = occupancy detected (valid in any mode)
             A = occupancy detected, sufficient to call for heat (iff in Sense/FP mode)
 
-            l = null != i.settings.experimentalFeatures && i.settings.experimentalFeatures.timerPlus,
+            l = null != i.settings.experimentalFeatures
+                && i.settings.experimentalFeatures.timerPlus,
             p = parseInt(n.iMode) === e.zoneModes.Mode_Footprint || l,    # sense mode?
             u = parseInt(n.iFlagExpectedKit) & e.equipmentTypes.Kit_PIR,  # has a PIR
             d = n.trigger.reactive && n.trigger.output,
@@ -138,27 +151,13 @@ class GeniusZone(GeniusBase):
 
             return root
 
-        self._data = result = {"id": self._raw["iID"], "name": self._raw["strName"]}
+        self._data = result = {}
         raw_json = self._raw  # TODO: remove raw_json, use self._raw
 
         try:  # convert zone (v1 attributes)
-            result["type"] = ITYPE_TO_TYPE[raw_json["iType"]]
-            if raw_json["iType"] == ZONE_TYPE.TPI and raw_json["zoneSubType"] == 0:
-                result["type"] = ITYPE_TO_TYPE[ZONE_TYPE.ControlOnOffPID]
+            result = self._properties.populate_v1_data(result)
 
-            result["mode"] = IMODE_TO_MODE[raw_json["iMode"]]
-
-            if raw_json["iType"] in [ZONE_TYPE.ControlSP, ZONE_TYPE.TPI]:
-                # some zones have a fPV without raw_json["activeTemperatureDevices"]
-                result["temperature"] = raw_json["fPV"]
-                result["setpoint"] = raw_json["fSP"]
-
-            if raw_json["iType"] == ZONE_TYPE.Manager:
-                if raw_json["fPV"]:
-                    result["temperature"] = raw_json["fPV"]
-
-            elif raw_json["iType"] == ZONE_TYPE.OnOffTimer:
-                result["setpoint"] = bool(raw_json["fSP"])
+            result = self._state.populate_v1_data(result)
 
             if self._has_pir:
                 if TYPE_TO_ITYPE[result["type"]] == ZONE_TYPE.ControlSP:
@@ -208,24 +207,24 @@ class GeniusZone(GeniusBase):
                 "Failed to convert Zone %s footprint schedule.", result["id"]
             )
 
-        try:  # convert extras (v3 attributes)
-            result["_state"] = {"bIsActive": raw_json["bIsActive"]}
-            result["output"] = int(raw_json["bOutRequestHeat"])
-
-            if raw_json["iType"] in [ZONE_TYPE.ControlSP]:
-                result["_state"]["bInHeatEnabled"] = raw_json["bInHeatEnabled"]
-
-        except (AttributeError, LookupError, TypeError, ValueError):
-            _LOGGER.exception("Failed to convert Zone %s extras.", result["id"])
-
         return self._data
+
+    @property
+    def properties(self) -> Properties:
+        """Return the properties of the zone."""
+        return self._properties
+
+    @property
+    def state(self) -> State:
+        """Return the current state of the zone."""
+        return self._state
 
     @property
     def _has_pir(self) -> bool:
         """Return True if the zone has a PIR (movement sensor)."""
         if self._hub.api_version == 1:
             return "occupied" in self.data
-        return self._raw["iFlagExpectedKit"] & ZONE_KIT.PIR
+        return self._properties.has_room_sensor
 
     @property
     def name(self) -> str:
